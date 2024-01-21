@@ -382,7 +382,11 @@ int main(int argc, char **argv) {
       } else if (strcmp(curr_cmd[0], "pwd") == 0) {
         rc = pwd(curr_cmd);
       } else {
+<<<<<<< HEAD
         rc = run_cmd(STDIN_FILENO, STDOUT_FILENO, curr_cmd);
+=======
+        rc = run_cmd(0, 1, curr_cmd);
+>>>>>>> 08dc9b4430d0b47039951c300a5ec701e707da5f
       }
       free(curr_cmd);
 
