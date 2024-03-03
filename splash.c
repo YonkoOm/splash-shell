@@ -51,7 +51,7 @@ int run_cmd(int input, int output, char **cmd) {
         close(output);
         return -1;
       }
-      close(input); // close read pipe fd as no longer neeeded
+      close(input); // close input/read-end as no longer neeeded
     }
 
     if (output != STDOUT_FILENO) {
@@ -60,7 +60,7 @@ int run_cmd(int input, int output, char **cmd) {
         close(output);
         return -1;
       }
-      close(output); // close write end fd as no longer needed
+      close(output); // close output/write-end as no longer needed
     }
 
     execv(cmd[0], cmd);
@@ -108,7 +108,7 @@ int pwd(char **cmd) {
     }
   }
   printf("%s\n", cwd);
-  fflush(stdout); // immediately flush output to console
+  fflush(stdout); // immediately flush working directory to console
 
   free(cwd);
   return 0;
@@ -150,13 +150,13 @@ int run_pipe(char **cmd, int num_args, int is_redir) {
   if (!curr_cmd)
     return -1;
 
-  int pipefds[2], read_pipe = STDIN_FILENO, curr_index = 0, pipes_visited = 0;
+  int pipefds[2], read_pipe = STDIN_FILENO, index = 0, pipes_visited = 0;
   i = 0;
-  while (pipes_visited != num_pipes) { // run commands b/f the last pipe
+  while (pipes_visited != num_pipes) { // run commands until the last pipe
     if (strcmp(cmd[i], "|") == 0) {
       pipes_visited++;
-      curr_cmd[curr_index] = NULL;
-      curr_index = 0;
+      curr_cmd[index] = NULL;
+      index = 0;
 
       pipe(pipefds);
 
@@ -172,18 +172,18 @@ int run_pipe(char **cmd, int num_args, int is_redir) {
 
       read_pipe = pipefds[0]; // stores read end of pipe for future iterations
     } else {
-      curr_cmd[curr_index++] = cmd[i];
+      curr_cmd[index++] = cmd[i];
     }
     i++;
   }
 
-  curr_index = 0;
+  // grab the last command after the final pipe and execute it
+  index = 0;
   while (cmd[i] && strcmp(cmd[i], ">") != 0) // gets command after the last pipe
-    curr_cmd[curr_index++] = cmd[i++];
-  curr_cmd[curr_index] = NULL;
+    curr_cmd[index++] = cmd[i++];
+  curr_cmd[index] = NULL;
 
   int rc;
-  // run the command after the last pipe
   if (is_redir) { // if true, output moves to file
     char *file = cmd[++i];
     int fd = open(file, O_CREAT | O_TRUNC | O_WRONLY, 0644);
@@ -196,22 +196,17 @@ int run_pipe(char **cmd, int num_args, int is_redir) {
   } else { // otherwise, it just outputs to console
     rc = run_cmd(read_pipe, STDOUT_FILENO, curr_cmd);
   }
-  if (rc == -1) {
-    free(curr_cmd);
-    return -1;
-  }
-
   close(read_pipe);
   free(curr_cmd);
-  return 0;
+  return rc;
 }
 
 int loop(char **cmd, int num_args, int is_redir, int is_pipe) {
   char *num = cmd[1];
-  if (!num) // check for num
+  if (!num)
     return -1;
   char *cmd_to_run = cmd[2];
-  if (!cmd_to_run) // if num exists, check for command
+  if (!cmd_to_run) // check for command if num exists
     return -1;
 
   for (size_t i = 0; i < strlen(num); i++)
@@ -323,7 +318,7 @@ int main() {
 
     int rc;     // return code
     char **cmd; // buffer to hold the command to run
-    int index;
+    int index;  // track position within the command buffer
     for (int i = 0; i < num_args; i++) {
       cmd = malloc((num_args + 1) * sizeof(char *));
       if (!cmd)
