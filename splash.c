@@ -36,14 +36,13 @@ int lexer(char *line, char ***args, int *num_args) {
   return 0;
 }
 
-/* A helper function that runs the passed in command in the child process after
- * forking the main process. If any file descriptors other than the normal input
- * and output file descriptors are passed in, we duplicate the file
- * descriptor(s) onto either 0 (stdin) or 1 (stdout) or both. If the output fd
- * differs, we also change duplicate the stderr to that passed in fd */
+/* A helper function that runs the command in a child process. If file
+ * descriptors other than the normal input and output fds are passed in, we
+ * duplicate the file descriptor(s) onto 0 (stdin), 1 (stdout) or both. If the
+ * output fd differs, we also duplicate output fd onto stderr */
 int run_cmd(int input, int output, char **cmd) {
   pid_t pid = fork();
-  if (pid == -1) { // checks if fork() failed
+  if (pid == -1) { // fork failure
     return -1;
   } else if (pid == 0) { // child process
     if (input != STDIN_FILENO) {
@@ -52,7 +51,7 @@ int run_cmd(int input, int output, char **cmd) {
         close(output);
         return -1;
       }
-      close(input);
+      close(input); // close read pipe fd as no longer neeeded
     }
 
     if (output != STDOUT_FILENO) {
@@ -61,11 +60,11 @@ int run_cmd(int input, int output, char **cmd) {
         close(output);
         return -1;
       }
-      close(output);
+      close(output); // close write end fd as no longer needed
     }
 
     execv(cmd[0], cmd);
-    exit(3); // exit with code 3 if execv fails
+    exit(3); // if execv fails, exit with code 3
   } else {   // parent process
     int status;
     wait(&status);
@@ -77,21 +76,24 @@ int run_cmd(int input, int output, char **cmd) {
 
 // changes the current directory
 int cd(char **cmd) {
-  char *path = cmd[1], *cmd_after_path = cmd[2];
-  if (!path || cmd_after_path) // only one arg needed (the path)
+  char *path = cmd[1];
+  if (!path)
     return -1;
+  char *cmd_after_path = cmd[2];
+  if (cmd_after_path)
+    return -1;
+
   return chdir(path);
 }
 
 // prints the path of the current directory
 int pwd(char **cmd) {
-  char *arg = cmd[1];
-  if (arg) // pwd should shouldn't be followed by any arguments
+  char *cmd_after_pwd = cmd[1];
+  if (cmd_after_pwd)
     return -1;
 
   int size = 256;
   char *cwd = malloc(size);
-
   while (!getcwd(cwd, size)) {
     if (errno == ERANGE) { // errno being set to ERANGE indicates range error
       size *= 2;
@@ -105,7 +107,6 @@ int pwd(char **cmd) {
       return -1;
     }
   }
-
   printf("%s\n", cwd);
   fflush(stdout); // immediately flush output to console
 
@@ -115,131 +116,125 @@ int pwd(char **cmd) {
 
 // redirects the output to the file specified instead of the console
 int redirection(char **cmd, int num_args) {
-  char **redir_cmd = malloc((num_args + 1) * sizeof(char *));
-  int i = 0;
+  char **curr_cmd = malloc((num_args + 1) * sizeof(char *));
+  if (!curr_cmd)
+    return -1;
 
+  int i = 0;
   while (strcmp(cmd[i], ">") != 0) {
-    redir_cmd[i] = cmd[i];
+    curr_cmd[i] = cmd[i];
     i++;
   }
-  redir_cmd[i] = NULL;
+  curr_cmd[i] = NULL;
 
   char *file = cmd[++i];
-
   int fd = open(file, O_CREAT | O_TRUNC | O_WRONLY, 0644);
   if (fd == -1) {
-    free(redir_cmd);
+    free(curr_cmd);
     return -1;
   }
-
-  int rc = run_cmd(0, fd, redir_cmd);
+  int rc = run_cmd(0, fd, curr_cmd);
 
   close(fd);
-  free(redir_cmd);
+  free(curr_cmd);
   return rc;
 }
 
 int run_pipe(char **cmd, int num_args, int is_redir) {
   int i = 0, num_pipes = 0;
-
   while (cmd[i])
     if (strcmp(cmd[i++], "|") == 0)
       num_pipes++;
 
-  i = 0;
-  int pipe_fd[2], prev_in = 0, curr_index = 0, pipes_visited = 0;
-  char **pipe_cmd = malloc((num_args + 1) * sizeof(char *));
-  if (!pipe_cmd)
+  char **curr_cmd = malloc((num_args + 1) * sizeof(char *));
+  if (!curr_cmd)
     return -1;
 
-  while (pipes_visited != num_pipes) { // runs all commands before the last pipe
+  int pipefds[2], read_pipe = STDIN_FILENO, curr_index = 0, pipes_visited = 0;
+  i = 0;
+  while (pipes_visited != num_pipes) { // run commands b/f the last pipe
     if (strcmp(cmd[i], "|") == 0) {
       pipes_visited++;
-      pipe_cmd[curr_index] = NULL;
+      curr_cmd[curr_index] = NULL;
       curr_index = 0;
 
-      pipe(pipe_fd);
+      pipe(pipefds);
 
-      if (run_cmd(prev_in, pipe_fd[1], pipe_cmd) == -1) {
-        free(pipe_cmd);
-        close(pipe_fd[0]);
-        close(pipe_fd[1]);
+      if (run_cmd(read_pipe, pipefds[1], curr_cmd) == -1) {
+        free(curr_cmd);
+        close(pipefds[0]);
+        close(pipefds[1]);
         return -1;
       }
-      close(pipe_fd[1]); // close write end of pipe as no longer needed
-      if (prev_in != 0)
-        close(prev_in);
+      close(pipefds[1]); // close write end of pipe as no longer needed
+      if (read_pipe != 0)
+        close(read_pipe);
 
-      prev_in = pipe_fd[0]; // stores read end in pipe for future iterations
+      read_pipe = pipefds[0]; // stores read end of pipe for future iterations
     } else {
-      pipe_cmd[curr_index++] = cmd[i];
+      curr_cmd[curr_index++] = cmd[i];
     }
     i++;
   }
 
   curr_index = 0;
-
-  while (cmd[i]) { // gets command after the last pipe
-    if (strcmp(cmd[i], ">") == 0)
-      break;
-    pipe_cmd[curr_index++] = cmd[i++];
-  }
-  pipe_cmd[curr_index] = NULL;
+  while (cmd[i] && strcmp(cmd[i], ">") != 0) // gets command after the last pipe
+    curr_cmd[curr_index++] = cmd[i++];
+  curr_cmd[curr_index] = NULL;
 
   int rc;
-
   // run the command after the last pipe
-  if (is_redir) { // if is_redir is true, redirects pipe command to file
+  if (is_redir) { // if true, output moves to file
     char *file = cmd[++i];
     int fd = open(file, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (fd == -1) {
-      free(pipe_cmd);
+      free(curr_cmd);
       return -1;
     }
-    rc = run_cmd(prev_in, fd, pipe_cmd);
+    rc = run_cmd(read_pipe, fd, curr_cmd);
     close(fd);
   } else { // otherwise, it just outputs to console
-    rc = run_cmd(prev_in, 1, pipe_cmd);
+    rc = run_cmd(read_pipe, STDOUT_FILENO, curr_cmd);
   }
-  close(prev_in);
-
   if (rc == -1) {
-    free(pipe_cmd);
+    free(curr_cmd);
     return -1;
   }
 
-  free(pipe_cmd);
+  close(read_pipe);
+  free(curr_cmd);
   return 0;
 }
 
 int loop(char **cmd, int num_args, int is_redir, int is_pipe) {
-  char *num = cmd[1], *cmd_to_run = cmd[2];
-  if (!num || !cmd_to_run)
+  char *num = cmd[1];
+  if (!num) // check for num
+    return -1;
+  char *cmd_to_run = cmd[2];
+  if (!cmd_to_run) // if num exists, check for command
     return -1;
 
-  for (int i = 0; i < strlen(num); i++)
+  for (size_t i = 0; i < strlen(num); i++)
     if (!isdigit(num[i]))
       return -1;
 
+  int rc;
   int num_loops = atoi(cmd[1]);
-
   for (int i = 0; i < num_loops; i++) {
+    rc = 0;
     if (is_pipe) {
-      if (run_pipe(cmd + 2, num_args, is_redir) == -1)
-        return -1;
+      rc = run_pipe(cmd + 2, num_args, is_redir);
     } else if (is_redir) {
-      if (redirection(cmd + 2, num_args) == -1)
-        return -1;
+      rc = redirection(cmd + 2, num_args);
     } else if (strcmp(cmd_to_run, "cd") == 0) {
-      if (cd(cmd + 2) == -1)
-        return -1;
+      rc = cd(cmd + 2);
     } else if (strcmp(cmd_to_run, "pwd") == 0) {
-      if (pwd(cmd + 2) == -1)
-        return -1;
+      rc = pwd(cmd + 2);
     } else {
-      if (run_cmd(0, 1, cmd + 2) == -1)
-        return -1;
+      rc = run_cmd(STDIN_FILENO, STDOUT_FILENO, cmd + 2);
     }
+    if (rc == -1)
+      return rc;
   }
   return 0;
 }
@@ -248,51 +243,46 @@ int loop(char **cmd, int num_args, int is_redir, int is_pipe) {
  * exists). If redir exists, makes look for any syntactical errors
  */
 int find_redir(char **cmd) {
-  int i = 0, redir_count = 0, is_redir = 0, redir_index = 0;
+  int i = 0, index = 0, count = 0;
   while (cmd[i]) {
-    for (int j = 0; j < strlen(cmd[i]); j++) {
+    for (size_t j = 0; j < strlen(cmd[i]); j++) {
       if (cmd[i][j] == '>') {
-        if (++redir_count > 1) // check only a single redirection in cmd
+        if (++count > 1 || i == 0)
           return -1;
-        is_redir = 1;
-        redir_index = i;
+        index = i;
       }
     }
     i++;
   }
 
-  if (is_redir) {
-    char *file = cmd[redir_index + 1];
-    char *cmd_after_file = cmd[redir_index + 2];
-    if (redir_index == 0 || !file ||
-        (cmd_after_file && strcmp(cmd_after_file, ";") != 0))
+  if (index > 0) {
+    char *file = cmd[index + 1];
+    char *extra_arg = cmd[index + 2];
+    if (!file || extra_arg)
       return -1;
     return 1;
   }
-
   return 0;
 }
 
 /* looks through the current command to look for any pipes (returns 1 if
- * exists). If pipe exits, checks for any pipe-related syntax errors (returns -1
- * if any) */
+ * exists). If pipe exists, checks for any pipe-related syntax errors (returns
+ * -1 if any) */
 int find_pipe(char **cmd) {
-  int is_pipe = 0, pipe_index = 0;
-
-  for (int i = 0; cmd[i]; i++) {
+  int i = 0, index = 0;
+  while (cmd[i]) {
     if (strcmp(cmd[i], "|") == 0) {
-      char *cmd_after_pipe = cmd[i + 1];
-      if (i == 0 || !cmd_after_pipe)
+      char *second_command = cmd[i + 1];
+      if (i == 0 || !second_command)
         return -1;
-      is_pipe = 1;
-      pipe_index = i;
+      index = i;
     } else if (strcmp(cmd[i], ">") == 0) {
-      int redir_index = i;
-      if (is_pipe && (redir_index < pipe_index))
+      if (index > 0 && (i < index)) // return -1 if redir bf pipe
         return -1;
     }
+    i++;
   }
-  return is_pipe;
+  return index > 0;
 }
 
 // frees all the allocated commands and arguments
@@ -302,89 +292,82 @@ void free_args(char **args, int num_args) {
   free(args);
 }
 
-int main(int argc, char **argv) {
+int main() {
   char error_message[30] = "An error has occurred\n";
+
   char *line;
   size_t len;
-
   while (1) {
     printf("splash> ");
     fflush(stdout); // immediately flush "splash> " to stdout
 
     line = NULL;
     len = 0;
-
     if (getline(&line, &len, stdin) == -1) {
       free(line);
+      if (feof(stdin))
+        exit(EXIT_SUCCESS);
       write(STDERR_FILENO, error_message, strlen(error_message));
     }
 
     char **args = NULL;
     int num_args = 0;
-
-    // splits the commands and args
-    if (lexer(line, &args, &num_args) == -1) {
+    if (lexer(line, &args, &num_args) == -1) { // tokenize user command
       free(line);
       write(STDERR_FILENO, error_message, strlen(error_message));
     }
     free(line);
 
-    if (!num_args)
+    if (num_args == 0)
       continue;
 
-    int rc;          // return code
-    char **curr_cmd; // pointer to char pointers (aka pointer to array strings)
-
+    int rc;     // return code
+    char **cmd; // buffer to hold the command to run
+    int index;
     for (int i = 0; i < num_args; i++) {
-      rc = 0;
-      curr_cmd = malloc((num_args + 1) * sizeof(char *));
-      if (!curr_cmd)
+      cmd = malloc((num_args + 1) * sizeof(char *));
+      if (!cmd)
         exit(EXIT_FAILURE);
 
-      int curr_index = 0;
-
-      /* insert args into current command buffer until we reach the last arg or
-       * hit a semicolon */
+      index = 0;
+      /* insert args into buffer until we hit the last arg or hit a semicolon */
       while (i < num_args && strcmp(args[i], ";") != 0)
-        curr_cmd[curr_index++] = args[i++];
-      curr_cmd[curr_index] = NULL;
+        cmd[index++] = args[i++];
+      cmd[index] = NULL;
 
-      char *is_arg = curr_cmd[0];
-      if (!is_arg) { // i.e. we only have a semicolon
-        free(curr_cmd);
+      if (!cmd[0]) { // checks for no args (i.e. we only have a semicolon)
+        free(cmd);
         continue;
       }
 
-      int is_redir = find_redir(curr_cmd), is_pipe = find_pipe(curr_cmd);
-
+      int is_redir = find_redir(cmd), is_pipe = find_pipe(cmd);
       if (is_redir == -1 || is_pipe == -1) {
         write(STDERR_FILENO, error_message, strlen(error_message));
         break;
       }
 
-      // series of if-statements check which command to run
-      if (strcmp(curr_cmd[0], "exit") == 0) {
-        char *arg = curr_cmd[1];
-        if (!arg) {
-          free(curr_cmd);
+      rc = 0;
+      if (strcmp(cmd[0], "exit") == 0) {
+        if (!cmd[1]) { // check for no additional args
+          free(cmd);
           free_args(args, num_args);
           exit(EXIT_SUCCESS);
         }
         rc = -1;
-      } else if (strcmp(curr_cmd[0], "loop") == 0) {
-        rc = loop(curr_cmd, num_args, is_redir, is_pipe);
+      } else if (strcmp(cmd[0], "loop") == 0) {
+        rc = loop(cmd, num_args, is_redir, is_pipe);
       } else if (is_pipe) {
-        rc = run_pipe(curr_cmd, num_args, is_redir);
+        rc = run_pipe(cmd, num_args, is_redir);
       } else if (is_redir) {
-        rc = redirection(curr_cmd, num_args);
-      } else if (strcmp(curr_cmd[0], "cd") == 0) {
-        rc = cd(curr_cmd);
-      } else if (strcmp(curr_cmd[0], "pwd") == 0) {
-        rc = pwd(curr_cmd);
+        rc = redirection(cmd, num_args);
+      } else if (strcmp(cmd[0], "cd") == 0) {
+        rc = cd(cmd);
+      } else if (strcmp(cmd[0], "pwd") == 0) {
+        rc = pwd(cmd);
       } else {
-        rc = run_cmd(STDIN_FILENO, STDOUT_FILENO, curr_cmd);
+        rc = run_cmd(STDIN_FILENO, STDOUT_FILENO, cmd);
       }
-      free(curr_cmd);
+      free(cmd);
 
       if (rc == -1) { // non-program related errors throw an error message
         write(STDERR_FILENO, error_message, strlen(error_message));
