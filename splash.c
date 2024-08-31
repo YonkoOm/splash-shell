@@ -251,7 +251,7 @@ int find_redir(char **cmd) {
     i++;
   }
 
-  // if redirection if found, validate the syntax
+  // if redirection is found, validate the syntax
   if (redir_index > 0) {
     char *file = cmd[redir_index + 1];
     if (!file)
