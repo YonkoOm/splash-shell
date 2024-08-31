@@ -40,27 +40,27 @@ int lexer(char *line, char ***args, int *num_args) {
  * descriptors other than the normal input and output fds are passed in, we
  * duplicate the file descriptor(s) onto 0 (stdin), 1 (stdout) or both. If the
  * output fd differs, we also duplicate output fd onto stderr */
-int run_cmd(int input, int output, char **cmd) {
+int run_cmd(int input_fd, int output_fd, char **cmd) {
   pid_t pid = fork();
   if (pid == -1) { // fork failure
     return -1;
   } else if (pid == 0) { // child process
-    if (input != STDIN_FILENO) {
-      if (dup2(input, STDIN_FILENO) == -1) {
-        close(input);
-        close(output);
+    if (input_fd != STDIN_FILENO) {
+      if (dup2(input_fd, STDIN_FILENO) == -1) {
+        close(input_fd);
+        close(output_fd);
         return -1;
       }
-      close(input); // close input/read-end as no longer neeeded
+      close(input_fd); // close input/read-end as no longer neeeded
     }
 
-    if (output != STDOUT_FILENO) {
-      if (dup2(output, STDOUT_FILENO) == -1 ||
-          dup2(output, STDERR_FILENO) == -1) {
-        close(output);
+    if (output_fd != STDOUT_FILENO) {
+      if (dup2(output_fd, STDOUT_FILENO) == -1 ||
+          dup2(output_fd, STDERR_FILENO) == -1) {
+        close(output_fd);
         return -1;
       }
-      close(output); // close output/write-end as no longer needed
+      close(output_fd); // close output/write-end as no longer needed
     }
 
     execv(cmd[0], cmd);
@@ -150,7 +150,7 @@ int run_pipe(char **cmd, int num_args, int is_redir) {
   if (!curr_cmd)
     return -1;
 
-  int pipefds[2], read_pipe = STDIN_FILENO, index = 0, pipes_visited = 0;
+  int pipefds[2], fd_read = STDIN_FILENO, index = 0, pipes_visited = 0;
   i = 0;
   while (pipes_visited != num_pipes) { // run commands until the last pipe
     if (strcmp(cmd[i], "|") == 0) {
@@ -160,17 +160,17 @@ int run_pipe(char **cmd, int num_args, int is_redir) {
 
       pipe(pipefds);
 
-      if (run_cmd(read_pipe, pipefds[1], curr_cmd) == -1) {
+      if (run_cmd(fd_read, pipefds[1], curr_cmd) == -1) {
         free(curr_cmd);
         close(pipefds[0]);
         close(pipefds[1]);
         return -1;
       }
       close(pipefds[1]); // close write end of pipe as no longer needed
-      if (read_pipe != 0)
-        close(read_pipe);
+      if (fd_read != STDIN_FILENO)
+        close(fd_read);
 
-      read_pipe = pipefds[0]; // stores read end of pipe for future iterations
+      fd_read = pipefds[0]; // stores read end of pipe for future iterations
     } else {
       curr_cmd[index++] = cmd[i];
     }
@@ -191,12 +191,12 @@ int run_pipe(char **cmd, int num_args, int is_redir) {
       free(curr_cmd);
       return -1;
     }
-    rc = run_cmd(read_pipe, fd, curr_cmd);
+    rc = run_cmd(fd_read, fd, curr_cmd);
     close(fd);
   } else { // otherwise, it just outputs to console
-    rc = run_cmd(read_pipe, STDOUT_FILENO, curr_cmd);
+    rc = run_cmd(fd_read, STDOUT_FILENO, curr_cmd);
   }
-  close(read_pipe);
+  close(fd_read);
   free(curr_cmd);
   return rc;
 }
@@ -238,22 +238,27 @@ int loop(char **cmd, int num_args, int is_redir, int is_pipe) {
  * exists). If redir exists, makes look for any syntactical errors
  */
 int find_redir(char **cmd) {
-  int i = 0, index = 0, count = 0;
+  int i = 0, redir_index = -1, count = 0;
   while (cmd[i]) {
     for (size_t j = 0; j < strlen(cmd[i]); j++) {
       if (cmd[i][j] == '>') {
-        if (++count > 1 || i == 0)
+        count++;
+        if (count > 1 || i == 0) // > 1 redirection or redirection at start
           return -1;
-        index = i;
+        redir_index = i;
       }
     }
     i++;
   }
 
-  if (index > 0) {
-    char *file = cmd[index + 1];
-    char *extra_arg = cmd[index + 2];
-    if (!file || extra_arg)
+  // if redirection if found, validate the syntax
+  if (redir_index > 0) {
+    char *file = cmd[redir_index + 1];
+    if (!file)
+      return -1;
+    // no extra arg, besides the file name, should follow redirection
+    char *extra_arg = cmd[redir_index + 2];
+    if (extra_arg)
       return -1;
     return 1;
   }
@@ -264,20 +269,21 @@ int find_redir(char **cmd) {
  * exists). If pipe exists, checks for any pipe-related syntax errors (returns
  * -1 if any) */
 int find_pipe(char **cmd) {
-  int i = 0, index = 0;
+  int i = 0, pipe_index = -1;
   while (cmd[i]) {
     if (strcmp(cmd[i], "|") == 0) {
-      char *second_command = cmd[i + 1];
-      if (i == 0 || !second_command)
+      // check if pipe is at start or if there is no command after pipe
+      if (i == 0 || !cmd[i + 1])
         return -1;
-      index = i;
+      pipe_index = i;
     } else if (strcmp(cmd[i], ">") == 0) {
-      if (index > 0 && (i < index)) // return -1 if redir bf pipe
+      // check if redirection is before a detected pipe
+      if (pipe_index != -1 && i < pipe_index)
         return -1;
     }
     i++;
   }
-  return index > 0;
+  return pipe_index > 0;
 }
 
 // frees all the allocated commands and arguments
@@ -300,7 +306,7 @@ int main() {
     len = 0;
     if (getline(&line, &len, stdin) == -1) {
       free(line);
-      if (feof(stdin))
+      if (feof(stdin)) // i.e. ctrl + d is pressed sending and EOF signal
         exit(EXIT_SUCCESS);
       write(STDERR_FILENO, error_message, strlen(error_message));
     }
@@ -316,19 +322,19 @@ int main() {
     if (num_args == 0)
       continue;
 
-    int rc;     // return code
-    char **cmd; // buffer to hold the command to run
-    int index;  // track position within the command buffer
+    int rc;        // return code
+    char **cmd;    // buffer to hold the command to run
+    int cmd_index; // track position within the command buffer
     for (int i = 0; i < num_args; i++) {
       cmd = malloc((num_args + 1) * sizeof(char *));
       if (!cmd)
         exit(EXIT_FAILURE);
 
-      index = 0;
-      /* insert args into buffer until we hit the last arg or hit a semicolon */
+      cmd_index = 0;
+      // insert args into buffer until we hit the last arg or hit a semicolon
       while (i < num_args && strcmp(args[i], ";") != 0)
-        cmd[index++] = args[i++];
-      cmd[index] = NULL;
+        cmd[cmd_index++] = args[i++];
+      cmd[cmd_index] = NULL;
 
       if (!cmd[0]) { // checks for no args (i.e. we only have a semicolon)
         free(cmd);
